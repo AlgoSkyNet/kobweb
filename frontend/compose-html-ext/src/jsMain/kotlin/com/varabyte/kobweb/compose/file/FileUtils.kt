@@ -10,10 +10,12 @@ import org.khronos.webgl.get
 import org.w3c.dom.Document
 import org.w3c.dom.HTMLAnchorElement
 import org.w3c.dom.HTMLInputElement
+import org.w3c.dom.events.Event
 import org.w3c.files.Blob
 import org.w3c.files.BlobPropertyBag
 import org.w3c.files.File
 import org.w3c.files.FileReader
+import org.w3c.xhr.ProgressEvent
 import kotlin.coroutines.resume
 import kotlin.coroutines.resumeWithException
 import kotlin.coroutines.suspendCoroutine
@@ -111,6 +113,24 @@ class LoadContext(
     val mimeType: String?,
 )
 
+private fun Document.loadFromDisk(
+    accept: String,
+    multiple: Boolean,
+    onChange: ((Event) -> dynamic)
+) {
+    val tempInput = (createElement("input") as HTMLInputElement).apply {
+        type = "file"
+        style.display = "none"
+        this.accept = accept
+        this.multiple = multiple
+    }
+
+    tempInput.onchange = onChange
+    body!!.append(tempInput)
+    tempInput.click()
+    tempInput.remove()
+}
+
 // I = input type (from the disk)
 // O = output type (produced for users)
 private fun <I, O> Document.loadFromDisk(
@@ -119,14 +139,7 @@ private fun <I, O> Document.loadFromDisk(
     deserialize: (I) -> O,
     onLoading: LoadContext.(O) -> Unit,
 ) {
-    val tempInput = (createElement("input") as HTMLInputElement).apply {
-        type = "file"
-        style.display = "none"
-        this.accept = accept
-        multiple = false
-    }
-
-    tempInput.onchange = { changeEvt ->
+    loadFromDisk(accept, multiple = false, onChange = { changeEvt ->
         val file = changeEvt.target.asDynamic().files[0] as File
 
         val reader = FileReader()
@@ -135,11 +148,7 @@ private fun <I, O> Document.loadFromDisk(
             onLoading(LoadContext(file.name, file.type.takeIf { it.isNotBlank() }), deserialize(result))
         }
         reader.triggerLoad(file)
-    }
-
-    body!!.append(tempInput)
-    tempInput.click()
-    tempInput.remove()
+    })
 }
 
 /**
@@ -209,6 +218,92 @@ fun Document.loadTextFromDisk(
     onLoaded: LoadContext.(String) -> Unit,
 ) {
     loadFromDisk<String, String>(
+        accept,
+        { file -> this.readAsText(file, encoding) },
+        { result -> result },
+        onLoaded
+    )
+}
+
+class LoadedFile<T>(
+    val context: LoadContext,
+    val result: LoadResult<T>
+) {
+    sealed interface LoadResult<T> {
+        class Success<T>(val contents: T) : LoadResult<T>
+        sealed class Failure<T>(val event: ProgressEvent) : LoadResult<T>
+        class Error<T>(event: ProgressEvent) : Failure<T>(event)
+        class Abort<T>(event: ProgressEvent) : Failure<T>(event)
+    }
+}
+
+
+private fun <I, O> Document.loadMultipleFromDisk(
+    accept: String = "",
+    triggerLoad: FileReader.(Blob) -> Unit,
+    deserialize: (I) -> O,
+    onLoading: (List<LoadedFile<O>>) -> Unit,
+) {
+    loadFromDisk(accept, multiple = true, onChange = { changeEvt ->
+        val selectedFiles = changeEvt.target.asDynamic().files
+        val length = selectedFiles.length as Int
+        val loadedFiles = mutableListOf<LoadedFile<O>>()
+
+        for (i in 0 until length) {
+            val reader = FileReader()
+            val file = selectedFiles[i] as File
+            val context = LoadContext(file.name, file.type.takeIf { it.isNotBlank() })
+            fun addLoadResult(loadResult: LoadedFile.LoadResult<O>) {
+                loadedFiles.add(LoadedFile(context, loadResult))
+                if (loadedFiles.size == length) {
+                    onLoading(loadedFiles)
+                }
+            }
+
+            reader.onabort = { addLoadResult(LoadedFile.LoadResult.Abort(it as ProgressEvent)) }
+            reader.onerror = { addLoadResult(LoadedFile.LoadResult.Error(it as ProgressEvent)) }
+            reader.onload = { loadEvt ->
+                val result = loadEvt.target.asDynamic().result as I
+                addLoadResult(LoadedFile.LoadResult.Success(deserialize(result)))
+            }
+            reader.triggerLoad(file)
+        }
+    })
+}
+
+fun Document.loadMultipleFromDisk(
+    accept: String = "",
+    onLoaded: (List<LoadedFile<ByteArray>>) -> Unit,
+) {
+    loadMultipleFromDisk<ArrayBuffer, ByteArray>(
+        accept,
+        FileReader::readAsArrayBuffer,
+        { result ->
+            val intArray = Int8Array(result)
+            ByteArray(intArray.byteLength) { i -> intArray[i] }
+        },
+        onLoaded
+    )
+}
+
+fun Document.loadMultipleDataUrlFromDisk(
+    accept: String = "",
+    onLoaded: (List<LoadedFile<String>>) -> Unit,
+) {
+    loadMultipleFromDisk<String, String>(
+        accept,
+        FileReader::readAsDataURL,
+        { result -> result },
+        onLoaded
+    )
+}
+
+fun Document.loadMultipleTextFromDisk(
+    accept: String = "",
+    encoding: String = "UTF-8",
+    onLoaded: (List<LoadedFile<String>>) -> Unit,
+) {
+    loadMultipleFromDisk<String, String>(
         accept,
         { file -> this.readAsText(file, encoding) },
         { result -> result },
